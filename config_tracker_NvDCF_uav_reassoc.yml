@@ -1,0 +1,158 @@
+%YAML:1.0
+####################################################################################################
+# UAV tracker config — derived from NVIDIA's config_tracker_NvDCF_accuracy.yml (DS 9.0) and tuned
+# for small, fast, low-texture UAV targets against sky.
+#
+# Goal vs config_tracker_NvDCF_perf.yml:
+#   1. Keep IDs consistent THROUGH occlusion  -> enableReAssoc (was entirely absent in the perf preset)
+#   2. Survive missed detections in consecutive frames -> shadow tracking + a KF that actually follows motion
+#
+# Design choices (see comments inline):
+#   - Re-association is MOTION-DOMINANT. Appearance ReID on a few-pixel UAV against sky is unreliable,
+#     so reidType=0 (motion-only tracklet matching). No ReID engine is built. If you later train a
+#     UAV-specific ReID model, see the commented [ReID] block at the bottom and bump reid weights.
+#   - Kalman noise uses the large "accuracy"-scale values so the filter follows erratic UAV motion
+#     instead of over-smoothing (the perf preset's stiff KF lagged behind maneuvers -> bad predicted
+#     box during a miss -> ID switch).
+#   - Association gates (IoU / size / visual) are loosened because small fast targets give low IoU
+#     and noisy box sizes between detector updates, and visual similarity is weak on bare sky.
+#
+# These are STARTING POINTS. Tune on your footage. Validate at interval=0 first (detector every
+# frame isolates tracker behavior), then move to interval=1 for live.
+####################################################################################################
+
+BaseConfig:
+  minDetectorConfidence: 0.1    # Detector boxes below this are ignored by the tracker. NOTE: upstream
+                                # pre-cluster-threshold=0.3 in the infer config gates first, so lower
+                                # that too if you want the tracker to see faint UAVs.
+
+TargetManagement:
+  enableBboxUnClipping: 1    # Unclip boxes near image border (UAVs entering/leaving frame)
+  preserveStreamUpdateOrder: 0
+  maxTargetsPerStream: 150   # Swarm: keep high. Includes shadow-mode targets.
+
+  # [Creation & Termination Policy]
+  minIouDiff4NewTarget: 0.2    # A new detection overlapping an existing target by more than this IoU is
+                               # discarded as a duplicate. Lowered 0.4->0.2 to suppress duplicate tracks
+                               # forming on the SAME drone (the genesis of the (0,0) ghost / 1<->3 flicker).
+                               # If real swarm drones flying close get suppressed, raise back toward 0.3.
+  minTrackerConfidence: 0.17   # Below this, the target drops to shadow mode. Lowered vs perf(0.40):
+                               # the DCF response is weak on low-texture UAVs, so 0.40 forced shadow
+                               # mode constantly. Re-assoc is the backstop for genuine losses.
+  probationAge: 1              # Show a track after 1 detection (kept from your perf tuning to not miss
+                               # first frames). Raise to 2-3 if false tentative tracks clutter swarms.
+  maxShadowTrackingAge: 50     # Frames a target survives unmatched before termination. With re-assoc on,
+                               # this only needs to bridge SHORT occlusions; longer gaps are recovered by
+                               # re-association after termination, so it no longer needs your old 200.
+                               # NOTE: with PGIE interval=1, raise this if short-gap IDs still drift.
+  earlyTerminationAge: 12      # Tentative (not-yet-confirmed) target dies if it misses this many frames.
+                               # Raised 2->12: flickering new UAVs need to survive short detector gaps
+                               # long enough to get a 2nd detection and confirm, instead of churning IDs.
+
+TrajectoryManagement:
+  useUniqueID: 0
+  enableReAssoc: 1             # *** THE KEY ADDITION *** restores the original ID when a terminated
+                               # track's trajectory matches a reappearing object.
+
+  # [Re-Assoc Metric: Thresholds for valid candidates]
+  minMatchingScore4Overall: 0.50         # Total re-assoc score gate. Below accuracy(0.66) so a strong
+                                         # MOTION match can pass without any appearance signal.
+  minTrackletMatchingScore: 0.25         # Motion/trajectory tracklet similarity gate
+  minMatchingScore4ReidSimilarity: 0.0   # Do NOT gate on appearance (UAV ReID is unreliable)
+
+  # [Re-Assoc Metric: Weights] -- MOTION DOMINANT
+  matchingScoreWeight4TrackletSimilarity: 1.0   # trust trajectory/motion
+  matchingScoreWeight4ReidSimilarity: 0.0       # ignore appearance (reidType=0 -> no reid features anyway)
+
+  # [Re-Assoc: Motion-based tracklet matching]
+  minTrajectoryLength4Projection: 20     # frames of history needed before a track can be projected.
+                                         # Lower than accuracy(34) -> faster reacquisition of short tracks.
+  prepLength4TrajectoryProjection: 58    # history length used to fit the projection
+  trajectoryProjectionLength: 33         # how far forward the lost track is projected to meet a new det
+  maxAngle4TrackletMatching: 67          # generous heading change for maneuvering drones [deg]
+  minSpeedSimilarity4TrackletMatching: 0.0574
+  minBboxSizeSimilarity4TrackletMatching: 0.1   # loose: UAV apparent size changes fast with range
+  maxTrackletMatchingTimeSearchRange: 30 # how many frames back to search for a re-assoc partner.
+                                         # ~1s at 30fps. Raise for longer occlusions.
+  trajectoryProjectionProcessNoiseScale: 0.0100
+  trajectoryProjectionMeasurementNoiseScale: 100
+  trackletSpacialSearchRegionScale: 0.0100
+
+  reidExtractionInterval: 8              # unused while reidType=0; kept for easy ReID enable later
+
+DataAssociator:
+  dataAssociatorType: 0
+  associationMatcherType: 1    # CASCADED (vs perf's GREEDY=0): better at crowded/occluded association
+  checkClassMatch: 1           # all UAVs are one class, so this neither helps nor hurts here
+
+  # [Association Metric: Thresholds for valid candidates]
+  # These are per-metric VETO floors: a candidate must clear EVERY one to be a valid match.
+  # The IoU and visual floors were silently rejecting re-acquisition after a few missed frames
+  # (fast UAV -> zero IoU; textureless UAV -> low DCF similarity). Zeroed so they can no longer
+  # veto a match; minMatchingScore4Overall (the weighted sum) is now the single real gate.
+  minMatchingScore4Overall: 0.10            # raised from 0.02 to stay selective now that the floors are off
+  minMatchingScore4SizeSimilarity: 0.0      # was 0.10 — don't veto on noisy UAV box size
+  minMatchingScore4Iou: 0.0                 # was 0.05 — don't veto when a fast UAV has no overlap across a gap
+  minMatchingScore4VisualSimilarity: 0.0    # was 0.30 — don't veto on weak bare-sky appearance
+
+  # [Association Metric: Weights]
+  matchingScoreWeight4VisualSimilarity: 0.2 # de-emphasize unreliable visual cue
+  matchingScoreWeight4SizeSimilarity: 0.4
+  matchingScoreWeight4Iou: 0.5              # IoU works again because the KF below predicts motion well
+
+  # [Association Metric: Tentative detections]
+  tentativeDetectorConfidence: 0.10
+  minMatchingScore4TentativeIou: 0.20
+
+StateEstimator:
+  stateEstimatorType: 1    # SIMPLE bbox KF (coherent with the re-assoc projection model in accuracy preset)
+
+  # [Dynamics Modeling] -- MODERATE/STABLE noise. The earlier accuracy-preset values (Loc 6810, Vel 1348)
+  # were far too large for slow/hovering small drones: the velocity estimate went wild, the predicted box
+  # jumped off-target, association collapsed, and the detection spawned a DUPLICATE track while the old one
+  # drifted to the image corner (the (0,0) "ghost"). These standard NvDCF values keep the estimate locked
+  # on the target. If you later have genuinely fast-maneuvering footage where tracks lag, raise Loc/Vel.
+  processNoiseVar4Loc: 2.0     # bbox center
+  processNoiseVar4Size: 1.0    # bbox size
+  processNoiseVar4Vel: 0.1     # velocity
+  measurementNoiseVar4Detector: 4.0     # trust the detector (reliable signal for UAVs)
+  measurementNoiseVar4Tracker: 16.0     # distrust the weak DCF visual estimate on tiny targets
+
+VisualTracker:
+  visualTrackerType: 2    # NvDCF_VPI
+
+  # [NvDCF: Feature Extraction]
+  useColorNames: 1
+  useHog: 1               # enable HOG (edges) for a little extra signal on otherwise textureless UAVs
+  featureImgSizeLevel: 3  # raise to 4 or 5 for very small UAVs (more feature resolution, costs perf)
+  featureFocusOffsetFactor_y: -0.1054
+
+  # [NvDCF: Correlation Filter]
+  filterLr: 0.0767
+  filterChannelWeightsLr: 0.0339
+  gaussianSigma: 0.5687
+
+####################################################################################################
+# OPTIONAL: appearance-based re-association. Only worth enabling if you train/obtain a ReID model
+# suited to UAVs (the stock resnet50_market1501 is a PERSON model and is meaningless for drones).
+# To enable: set reidType: 2 above-pattern, raise matchingScoreWeight4ReidSimilarity (~0.3) and
+# minMatchingScore4ReidSimilarity, then uncomment and point this block at your model.
+#
+# ReID:
+#   reidType: 2                 # 0=off(motion-only), 1=NvDeepSORT, 2=reid-reassoc, 3=both
+#   batchSize: 100
+#   workspaceSize: 1000
+#   reidFeatureSize: 256
+#   reidHistorySize: 100
+#   inferDims: [3, 256, 128]
+#   networkMode: 1              # 0=fp32 1=fp16 2=int8
+#   inputOrder: 0              # NCHW
+#   colorFormat: 0             # RGB
+#   offsets: [123.6750, 116.2800, 103.5300]
+#   netScaleFactor: 0.01735207
+#   keepAspc: 1
+#   useVPICropScaler: 1
+#   addFeatureNormalization: 1
+#   minVisibility4GalleryUpdate: 0.6
+#   modelEngineFile: "/path/to/your_uav_reid_b100_fp16.engine"
+####################################################################################################
