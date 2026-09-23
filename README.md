@@ -8,6 +8,8 @@ The project focused on understanding how detection, visual tracking, motion esti
 
 I made a [presentation](https://drive.google.com/file/d/11qaaTEZbEJRMN1Cu_hqha5cqz3EFdIC9/view?usp=sharing) documenting my findings and I hope to share an overview here.
 
+Here is a cool tracking [demo](https://drive.google.com/file/d/119tJ43KYTmtBxwRvZEcFBjKPFQn7_3Ln/view?usp=sharing) on a sample video.
+
 ## Overview
 
 NvDCF combines detector outputs with visual and motion-based tracking.
